@@ -8,6 +8,9 @@ import {
   CompletionList,
   Hover,
   MarkupKind,
+  SignatureHelp,
+  SignatureInformation,
+  uinteger,
 } from "vscode-languageserver";
 import { Position } from "vscode-languageserver-textdocument";
 
@@ -279,6 +282,210 @@ export class CompletionProvider {
         });
       }
     }
+  }
+
+  getSignatureHelp(
+    position: Position,
+    activeSignature?: uinteger,
+  ): Promise<SignatureHelp | undefined> {
+    const line = this.model.getLine(position.line);
+    const tokens = this.syntaxProvider.getSyntax(position.line);
+    let keyword: string;
+    let zone: number | undefined;
+    let activeParameter = 0;
+    let bracketLevel = 0;
+    for (let j = tokens.length - 1; j >= 0; j--) {
+      const start = tokens[j].start;
+      const end = j === tokens.length - 1 ? line.length : tokens[j + 1].start;
+      if (end <= position.character) {
+        if (
+          tokens[j].style !== "sep" &&
+          tokens[j].style !== "keyword" &&
+          tokens[j].style !== "macro-keyword"
+        ) {
+          continue;
+        }
+        const _keyword = this.model.getText({
+          start: { line: position.line, column: start },
+          end: { line: position.line, column: end },
+        });
+        if (bracketLevel === -1) {
+          if (_keyword === ")") {
+            bracketLevel = 1;
+            activeParameter = 0;
+            continue;
+          }
+          if (_keyword === "(") {
+            continue;
+          }
+          if (_keyword === ",") {
+            bracketLevel = 0;
+            activeParameter = 1;
+            continue;
+          }
+
+          zone = this.czMgr.getCurrentZone(position.line, start + 1);
+          if (zone === ZONE_TYPE.SAS_FUNC || zone === ZONE_TYPE.MACRO_FUNC) {
+            keyword = _keyword;
+            break;
+          }
+        } else if (_keyword === ")") {
+          bracketLevel++;
+        } else if (_keyword === "(") {
+          bracketLevel--;
+        } else if (_keyword === "," && bracketLevel === 0) {
+          activeParameter++;
+        }
+      }
+    }
+
+    return new Promise((resolve) => {
+      if (!keyword || !zone) {
+        resolve(undefined);
+      } else {
+        this._loadHelp({
+          keyword,
+          type: "hint",
+          zone,
+          procName: this.czMgr.getProcName(),
+          stmtName: this.czMgr.getStmtName(),
+          optName: this.czMgr.getOptionName(),
+          cb: (data) => {
+            if (data && data.key && data.syntax && data.data) {
+              let addr =
+                "https://support.sas.com/en/search.html?" +
+                "fq=releasesystem%3AViya&" +
+                "q=" +
+                keyword?.replace("%", "");
+              if (data.supportSite) {
+                addr =
+                  "https://documentation.sas.com/?docsetId=" +
+                  data.supportSite.docsetId +
+                  "&docsetVersion=" +
+                  data.supportSite.docsetVersion +
+                  "&docsetTarget=";
+                if (
+                  zone === ZONE_TYPE.PROC_DEF ||
+                  zone === ZONE_TYPE.SAS_FUNC ||
+                  !data.supportSite.supportSiteTargetFile
+                ) {
+                  addr += data.supportSite.docsetTargetFile;
+                } else {
+                  addr += data.supportSite.supportSiteTargetFile;
+                  if (data.supportSite.supportSiteTargetFragment) {
+                    addr += "#" + data.supportSite.supportSiteTargetFragment;
+                  }
+                }
+              } else {
+                addr = addr.replace(/\s/g, "%20");
+              }
+              const _keyword =
+                "[" +
+                _cleanUpKeyword(data.key.toUpperCase()) +
+                "](" +
+                addr +
+                ")";
+
+              // solve function overloading
+              // because regexp match from start to end, so need the following params
+              let isFirstMatch = true;
+              let index = 0;
+              let match: any;
+              let _match: any;
+              const syntaxArr = [];
+              const regexp = new RegExp(data.key, "g");
+              // if it's function overloading, data.syntax will have multiple data.key
+              while ((match = regexp.exec(data.syntax)) !== null) {
+                if (isFirstMatch) {
+                  isFirstMatch = false;
+                  continue;
+                }
+                syntaxArr.push(data.syntax.slice(index, match.index));
+                index = match.index;
+                _match = match;
+              }
+              // the last match
+              if (_match) {
+                syntaxArr.push(data.syntax.slice(_match.index));
+              }
+              // no function overloading, push the first match
+              if (!syntaxArr.length) {
+                syntaxArr.push(data.syntax);
+              }
+
+              // match arguments
+              const signatures: SignatureInformation[] = [];
+              syntaxArr.forEach((syntax) => {
+                syntax = syntax
+                  .replace(/\*/g, "")
+                  .replace(/<sub>/g, "")
+                  .replace(/<\/sub>/g, "")
+                  .replace(/&lt;/g, "<")
+                  .replace(/&gt;/g, ">")
+                  .replace(/\s+/g, " ")
+                  .replace(/\s*Form \d:\s*/gi, "");
+                // arguments in syntax
+                const argumentsInSyntax = syntax
+                  .match(/\((.*)\)/)?.[1]
+                  ?.split(",")
+                  .map((argument) =>
+                    argument.replace(/</g, "").replace(/>/g, "").trim(),
+                  );
+                // match like DIM <N> (array-name)
+                const outerArguments = syntax
+                  .match(new RegExp(`${keyword}\\s+(.*?)\\s+\\(`, "i"))?.[1]
+                  ?.replace(/</g, "")
+                  .replace(/>/g, "")
+                  .split(",")
+                  .map((argument) => argument.trim());
+                // the left arguments in data.arguments but ont in syntax
+                const leftArguments = data.arguments
+                  ?.filter(
+                    (item) =>
+                      !argumentsInSyntax?.includes(item.name) &&
+                      !outerArguments?.includes(item.name),
+                  )
+                  .map((item) => `**${item.name}:** ${item.description}`)
+                  .join("\n\n");
+
+                signatures.push({
+                  label: syntax,
+                  documentation: data.data,
+                  parameters: argumentsInSyntax?.map((argument) => {
+                    const _documentation = data.arguments?.find(
+                      (item) => item.name === argument,
+                    )?.description;
+                    const outerArgsDocumentation = data.arguments
+                      ?.filter((item) => outerArguments?.includes(item.name))
+                      .map((item) => `**${item.name}:** ${item.description}`)
+                      .join("\n\n");
+                    const documentation = _documentation
+                      ? outerArgsDocumentation
+                        ? `**${argument}:** ${_documentation}\n\n${outerArgsDocumentation}`
+                        : `**${argument}:** ${_documentation}`
+                      : outerArgsDocumentation
+                      ? outerArgsDocumentation
+                      : leftArguments;
+                    return {
+                      label: argument,
+                      documentation: {
+                        kind: MarkupKind.Markdown,
+                        value:
+                          (documentation ? documentation : "") +
+                          `\n\nDocumentation: ${_keyword}`,
+                      },
+                    };
+                  }),
+                });
+              });
+              resolve({ signatures, activeSignature, activeParameter });
+            } else {
+              resolve(undefined);
+            }
+          },
+        });
+      }
+    });
   }
 
   getCompleteItems(
@@ -1225,6 +1432,7 @@ export class CompletionProvider {
         contextText = "";
         linkTail = keyword.replace("%", "");
     }
+
     let addr =
       "https://support.sas.com/en/search.html?" +
       sasReleaseParam +
